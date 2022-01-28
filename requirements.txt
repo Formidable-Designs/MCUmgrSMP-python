@@ -1,0 +1,3 @@
+cbor
+bluezero
+asyncio_glib
