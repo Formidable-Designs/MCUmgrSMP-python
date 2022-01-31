@@ -229,10 +229,18 @@ async def main(deviceAddress, firmwareFilePath, version):
     logger.debug("Images: %s" %images)
     imageHash = [i['hash'] for i in images if i['version']==version]
     if len(imageHash) < 1:
-        logging.error("Couldn't find an image for version %s on the device, Uploading it..." %version)
+        logging.info("Couldn't find an image for version %s on the device, Uploading it..." %version)
         await uploadFile(firmwareFilePath, c)
+        images = await listImages(c)
+        logger.debug("Images: %s" %images)
+        imageHash = [i['hash'] for i in images if i['version']==version]
+        if len(imageHash) < 1:
+            logging.error("After uploading firmware file %s, couldn't find version. Is this the correct version?" %(firmwareFilePath, version))
+            sys.exit(-2)
+        logging.info("Found version %s on the device with hash %s. Now activating it." %(version, imageHash[0]))
+        await testImage(imageHash[0], c)
     else:     
-        logging.debug("Found version %s on the device with hash %s. Now activating it." %(version, imageHash[0]))
+        logging.info("Found version %s on the device with hash %s. Now activating it." %(version, imageHash[0]))
         await testImage(imageHash[0], c)
 
 if __name__ == "__main__":
