@@ -1,7 +1,7 @@
-#!/usr/bin/python3
+#!/usr/bin/env python3
 import sys
 import os
-from bluezero import device, GATT, adapter
+from bluezero import adapter, device, GATT
 import cbor
 from hashlib import sha256
 import asyncio_glib
@@ -10,15 +10,7 @@ import struct
 import asyncio
 import logging
 import SMP
-
-MIN_PYTHON = (3, 7)
-if sys.version_info < MIN_PYTHON:
-    sys.exit("Python %s.%s or later is required.\n" % MIN_PYTHON)
-
-
-# See https://devzone.nordicsemi.com/cfs-file/__key/communityserver-discussions-components-files/4/MCUmgr_5F00_Bluetooth_5F00_protocol.pdf
-deviceAddress="DA:BC:1B:2C:89:2D"
-firmwareFilePath="/root/bridgedata/firmware/SRL560/nrf52840dk/SRL560-nrf52840dk-0.0.39.bin"
+import dbus
 
 MCUMGR_SMP_SERVICE_UUID = "8d53dc1d-1db7-4cd3-868B-8a527460aa84"
 MCUMGR_SMP_CHAR_UUID =    "da2e7828-fbce-4e01-ae9e-261174997c48"
@@ -31,14 +23,38 @@ logger.setLevel(logging.DEBUG)
 async def getCharacteristic(adapterAddress, deviceAddress, serviceUUID, charUUID):
     c = GATT.Characteristic(adapterAddress, deviceAddress, serviceUUID, charUUID)
     counter = 0
-    while not c.resolve_gatt() and counter < 20:
+    while not c.resolve_gatt() and counter < 20 and not c.characteristic_props:
         await asyncio.sleep(.5)
         counter = counter + 1
 
-    if c.resolve_gatt():
+    if c.resolve_gatt() and c.characteristic_props:
         return c
     else:
         raise Exception("Couldn't resolve GATT characteristic %s after trying for %d seconds." %(charUUID, 5))
+
+# Extensions of bluezero
+def mtu(characteristic):
+    _, mtu = characteristic.characteristic_methods.AcquireWrite(dbus.Dictionary({}))
+    return int(mtu)
+
+
+def write_value(characteristic, value, flags=''):
+    """
+    Write a new value to the characteristic.
+
+    :param value: A list of byte values
+    :param flags: Optional dictionary.
+        Typically empty. Values defined at:
+        https://git.kernel.org/pub/scm/bluetooth/bluez.git/tree/doc/gatt-api.txt
+    """
+    try:
+        characteristic.characteristic_methods.WriteValue(value, dbus.Dictionary(flags))
+    except AttributeError:
+        logger.error('Service: %s with Characteristic: %s not defined on'
+                     'on device: %s. Cannot write_value',  characteristic.srv_uuid,
+                     characteristic.chrc_uuid, characteristic.device_addr)
+
+# end extensions of bluezero
 
 
 async def uploadFile(filePath, smpCharacteristic):
@@ -64,19 +80,19 @@ async def uploadFile(filePath, smpCharacteristic):
     smpCharacteristic.add_characteristic_cb(functools.partial(notificationCallback, notificationQueue))
     smpCharacteristic.start_notify()
 
-    mtuSize = smpCharacteristic.MTU()
+    mtuSize = mtu(smpCharacteristic)
     logger.debug("MTU size is %d" %mtuSize)
 
     offset = 0
     lastReportedProgress = -1
     while offset < len(data):
         try:
-            dataLength = min(mtuSize - calculatePacketOverhead(data, offset), len(data) - offset)
+            dataLength = min(mtuSize - SMP.MgmtMsg.calculatePacketOverhead(data, offset), len(data) - offset)
 
             f = { 'data': data[offset : offset + dataLength], 'off': offset, 'image': 0}
             if offset == 0:
                 f['sha'] = sha
-                f['len'] = os.path.getsize(firmwareFilePath)
+                f['len'] = os.path.getsize(filePath)
 
             req.set_payload(cbor.dumps(f))
             payload = req.to_bytes()
@@ -86,14 +102,14 @@ async def uploadFile(filePath, smpCharacteristic):
                 logger.debug("Sending %d bytes @ offset %d of %d (%d%%)" %(len(payload), offset, len(data), progress))
                 lastReportedProgress = progress
 
-            smpCharacteristic.write_value(payload, flags={'type': 'command'}) # type 'command' is write without response.
+            write_value(smpCharacteristic, payload, flags={'type': 'command'}) # type 'command' is write without response.
 
             notificationData = await asyncio.wait_for(notificationQueue.get(), 1)
             reply = SMP.MgmtMsg.from_bytes(notificationData)
             d = cbor.loads(reply.payload)
             #  {'rc': 0, 'off': 200}.
             if d['rc'] != 0:
-                self.error("Received status %d after a writei at offset %d." %(d['rc'], offset))
+                logger.error("Received status %d after a write at offset %d." %(d['rc'], offset))
             offset = d['off']
 
             #await asyncio.sleep(.1)
@@ -107,8 +123,6 @@ async def uploadFile(filePath, smpCharacteristic):
     smpCharacteristic.add_characteristic_cb()
 
 async def listImages(smpCharacteristic):
-    groupd, cmdId = SMP.SMP_COMMAND['IMAGE']['STATE']
-    req = SMP.MgmtMsg(operation=SMP.SMP_OPERATION['READ'], groupId=groupId, commandId=cmdId, payload=cbor.dumps({}))
 
     def notificationCallback(dataQueue, iface, changedProps, invalidatedProps):
         if not changedProps:
@@ -123,12 +137,10 @@ async def listImages(smpCharacteristic):
     smpCharacteristic.add_characteristic_cb(functools.partial(notificationCallback, notificationQueue))
     smpCharacteristic.start_notify()
 
+    groupId, cmdId = SMP.SMP_COMMAND['IMAGE']['STATE']
+    req = SMP.MgmtMsg(operation=SMP.SMP_OPERATION['READ'], groupId=groupId, commandId=cmdId, payload=cbor.dumps({}))
     payload = req.to_bytes()
-
-    mtuSize = smpCharacteristic.MTU()
-    logger.debug("MTU size is %d" %mtuSize)
-
-    smpCharacteristic.write_value(payload, flags={ 'type': 'command' }) # type 'command' is write without response.
+    write_value(smpCharacteristic, payload, flags={ 'type': 'command' }) # type 'command' is write without response.
     logger.debug("Wrote payload 0x%s." %payload.hex())
 
  
@@ -170,10 +182,10 @@ async def testImage(imageHash, smpCharacteristic):
 
     payload = req.to_bytes()
 
-    mtuSize = smpCharacteristic.MTU()
+    mtuSize = mtu(smpCharacteristic)
     logger.debug("MTU size is %d" %mtuSize)
 
-    smpCharacteristic.write_value(payload, flags={ 'type': 'command' }) # type 'command' is write without response.
+    write_value(smpCharacteristic, payload, flags={ 'type': 'command' }) # type 'command' is write without response.
     logger.debug("Wrote payload 0x%s." %payload.hex())
 
     notificationData = await notificationQueue.get()
@@ -187,24 +199,23 @@ async def testImage(imageHash, smpCharacteristic):
     reply = SMP.MgmtMsg.from_bytes(notificationData)
     d = cbor.loads(reply.payload)
 
-
     groupId, cmdId = SMP.SMP_COMMAND['OS']['RESET']
     req = SMP.MgmtMsg(operation=SMP.SMP_OPERATION['WRITE'], groupId=groupId, commandId=cmdId, payload=cbor.dumps({}))
     payload = req.to_bytes()
-    smpCharacteristic.write_value(payload, flags={ 'type': 'command' }) # type 'command' is write without response.
+    write_value(smpCharacteristic, payload, flags={ 'type': 'command' }) # type 'command' is write without response.
     logger.debug("Reset the device.")
 
-async def main():
-
+async def main(deviceAddress, firmwareFilePath, version):
     a = list(adapter.Adapter.available())[0]
     logger.info("Discovering devices on adapter %s..." %(a.name))
     a.start_discovery()
 
     await asyncio.sleep(5)
 
-    lock = device.Device(a.address, deviceAddress)
-    logger.info("Connecting to lock %s..." %(deviceAddress))
-    lock.connect(timeout=20)
+    d = device.Device(adapter_addr=a.address, device_addr=deviceAddress)
+
+    logger.info("Connecting to device %s..." %(d.address))
+    d.connect(timeout=20)
     a.stop_discovery()
     logger.info("Connected.")
 
@@ -212,24 +223,34 @@ async def main():
 
     logger.info("Resolving DFU characterstic %s..." %MCUMGR_SMP_CHAR_UUID)
     c = await getCharacteristic(a.address, deviceAddress, MCUMGR_SMP_SERVICE_UUID, MCUMGR_SMP_CHAR_UUID)
-    # gdbus introspect -y -d "org.bluez" -o "/org/bluez/hci0/dev_DA_BC_1B_2C_89_2D/service002f/char0030"
 
-
+    logger.info("Checking if firmware version %s is already on the device." %version)
     images = await listImages(c)
     logger.debug("Images: %s" %images)
-    imageHash = [i['hash'] for i in images if i['version']=='0.0.39']
+    imageHash = [i['hash'] for i in images if i['version']==version]
     if len(imageHash) < 1:
-        logging.error("Couldn't find an image for version 0.0.39. Uploading it...")
+        logging.error("Couldn't find an image for version %s on the device, Uploading it..." %version)
         await uploadFile(firmwareFilePath, c)
     else:     
-        logging.debug("Testing image hash %s." %imageHash[0])
+        logging.debug("Found version %s on the device with hash %s. Now activating it." %(version, imageHash[0]))
         await testImage(imageHash[0], c)
 
 if __name__ == "__main__":
+    MIN_PYTHON = (3, 7)
+    if sys.version_info < MIN_PYTHON:
+        sys.exit("Python %s.%s or later is required.\n" % MIN_PYTHON)
+
+    if len(sys.argv) != 4:
+        sys.exit("Usage: smp.py ble-address firmwareFilePath version.\nExample: smp.py DA:BC:1B:2C:89:2D /tmp/firmware.bin 0.0.39")
+
+    address = sys.argv[1]
+    firmwareFile = sys.argv[2]
+    version = sys.argv[3]
+
     formatter = logging.Formatter("%(asctime)s %(levelname)s %(name)s: %(message)s")
     consoleHandler = logging.StreamHandler(sys.stdout)
     consoleHandler.setFormatter(formatter)
     logger.addHandler(consoleHandler)
 
     asyncio.set_event_loop_policy(asyncio_glib.GLibEventLoopPolicy())
-    asyncio.run(main())
+    asyncio.run(main(address, firmwareFile, version))
