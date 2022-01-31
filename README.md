@@ -3,8 +3,8 @@ Over-the-air firmware updates over bluetooth using MUCmgr's SMP procotol
 
 
 ## Installing
-sudo apt install libcairo2-dev pkg-config python3-dev bluez
-pip install -r requirements.txt
+    sudo apt install libcairo2-dev pkg-config python3-dev bluez
+    pip install -r requirements.txt
 
 
 ## Uploading firmware and activing firmware
